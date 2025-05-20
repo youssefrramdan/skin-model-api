@@ -42,7 +42,7 @@ CLASS_NAMES = ['MEL', 'NV', 'BCC', 'AK', 'BKL', 'DF', 'VASC', 'SCC']
 
 def preprocess_image(image: Image.Image):
     """Preprocess image for model input"""
-    img = image.convert("RGB").resize((224, 224))
+    img = image.convert("RGB").resize((256, 256))
     arr = np.array(img, dtype=np.float32)
     arr = np.expand_dims(arr, axis=0)
     arr = arr / 255.0  # Normalize to [0,1]
@@ -106,7 +106,7 @@ def info():
         "app_name": "Skin Cancer Detection API",
         "model": "Skin Cancer Classification using TensorFlow Lite",
         "classes": CLASS_NAMES,
-        "input_shape": "224x224 RGB image",
+        "input_shape": "256x256 RGB image",
         "endpoints": {
             "/predict": "POST - Upload an image file for classification",
             "/info": "GET - Get information about this API",
