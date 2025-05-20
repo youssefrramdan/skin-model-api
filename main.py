@@ -2,109 +2,113 @@ from flask import Flask, request, jsonify
 from PIL import Image
 import numpy as np
 import tflite_runtime.interpreter as tflite
-import requests
 from io import BytesIO
 import time
 import os
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Load both TFLite models
-STATUS_MODEL_PATH = "status_model.tflite"
-CANCER_MODEL_PATH = "Skin.tflite"
+# Load TFLite model
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "Skin_model_optimized.tflite")
 
-if not os.path.exists(STATUS_MODEL_PATH) or not os.path.exists(CANCER_MODEL_PATH):
-    raise FileNotFoundError("Required model files not found")
+logger.info(f"Looking for model in directory: {os.path.dirname(__file__)}")
+logger.info(f"Model path: {MODEL_PATH}")
 
-# Initialize TFLite interpreters
-status_interpreter = tflite.Interpreter(model_path=STATUS_MODEL_PATH)
-cancer_interpreter = tflite.Interpreter(model_path=CANCER_MODEL_PATH)
+if not os.path.exists(MODEL_PATH):
+    logger.error(f"Model not found at {MODEL_PATH}")
+    raise FileNotFoundError(f"Model file not found at {MODEL_PATH}")
 
-status_interpreter.allocate_tensors()
-cancer_interpreter.allocate_tensors()
+# Initialize TFLite interpreter
+try:
+    logger.info("Initializing model interpreter...")
+    interpreter = tflite.Interpreter(model_path=MODEL_PATH)
+    interpreter.allocate_tensors()
+    logger.info("Model loaded successfully!")
+except Exception as e:
+    logger.error(f"Error loading model: {str(e)}")
+    raise
 
-# Get input and output tensors for both models
-status_input_details = status_interpreter.get_input_details()
-status_output_details = status_interpreter.get_output_details()
-
-cancer_input_details = cancer_interpreter.get_input_details()
-cancer_output_details = cancer_interpreter.get_output_details()
+# Get input and output tensors
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
 
 # Define class names
-STATUS_CLASSES = ['Normal', 'Affected']
-CANCER_CLASSES = ['MEL', 'BCC', 'SCC', 'AK', 'BKL', 'DF', 'VASC']
+CLASS_NAMES = ['MEL', 'NV', 'BCC', 'AK', 'BKL', 'DF', 'VASC', 'SCC']
 
 def preprocess_image(image: Image.Image):
     """Preprocess image for model input"""
     img = image.convert("RGB").resize((224, 224))
     arr = np.array(img, dtype=np.float32)
     arr = np.expand_dims(arr, axis=0)
-    arr = arr / 255.0
+    arr = arr / 255.0  # Normalize to [0,1]
     return arr
-
-def get_prediction(interpreter, input_details, output_details, img_array):
-    """Get prediction from specified model"""
-    interpreter.set_tensor(input_details[0]['index'], img_array)
-    interpreter.invoke()
-    return interpreter.get_tensor(output_details[0]['index'])
 
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
-        # Get image URL from request
-        request_data = request.get_json()
-        if not request_data or 'image_url' not in request_data:
-            return jsonify({"error": "No image URL provided"}), 400
+        # Check if file is in the request
+        if 'file' not in request.files:
+            return jsonify({"error": "No file uploaded"}), 400
 
-        image_url = request_data['image_url']
+        file = request.files['file']
 
-        # Download and process image
-        response = requests.get(image_url, timeout=10)
-        content_type = response.headers.get("Content-Type", "")
-        if not content_type.startswith("image/"):
-            return jsonify({"error": f"Invalid content type: {content_type}"}), 400
+        # Check if a file was actually selected
+        if file.filename == '':
+            return jsonify({"error": "No file selected"}), 400
 
-        img = Image.open(BytesIO(response.content))
+        # Check if the file is an image
+        if not file.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.tiff', '.bmp')):
+            return jsonify({"error": "File type not allowed. Please upload an image file"}), 400
+
+        # Open and process the image
+        img = Image.open(file.stream)
         img_array = preprocess_image(img)
 
-        # Get status prediction first
-        status_predictions = get_prediction(status_interpreter, status_input_details, status_output_details, img_array)
-        status_class = STATUS_CLASSES[np.argmax(status_predictions[0])]
-        status_confidence = float(np.max(status_predictions[0]))
+        # Make prediction
+        interpreter.set_tensor(input_details[0]['index'], img_array)
+        interpreter.invoke()
+        predictions = interpreter.get_tensor(output_details[0]['index'])
+
+        # Get top prediction
+        predicted_class = CLASS_NAMES[np.argmax(predictions[0])]
+        confidence = float(np.max(predictions[0]))
+
+        # Get top 3 predictions
+        top_3_indices = np.argsort(predictions[0])[-3:][::-1]
+        top_3_predictions = [
+            {
+                "class": CLASS_NAMES[idx],
+                "confidence": float(predictions[0][idx])
+            }
+            for idx in top_3_indices
+        ]
 
         result = {
-            "status": status_class,
-            "status_confidence": round(status_confidence, 4)
+            "prediction": predicted_class,
+            "confidence": round(confidence, 4),
+            "top_3_predictions": top_3_predictions
         }
-
-        # If affected, get cancer type prediction
-        if status_class == 'Affected':
-            cancer_predictions = get_prediction(cancer_interpreter, cancer_input_details, cancer_output_details, img_array)
-            cancer_type = CANCER_CLASSES[np.argmax(cancer_predictions[0])]
-            cancer_confidence = float(np.max(cancer_predictions[0]))
-
-            result.update({
-                "cancer_type": cancer_type,
-                "cancer_confidence": round(cancer_confidence, 4)
-            })
 
         return jsonify(result)
 
     except Exception as e:
+        logger.error(f"Error during prediction: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/info', methods=['GET'])
 def info():
     return jsonify({
         "app_name": "Skin Cancer Detection API",
-        "models": {
-            "status_model": "Detects if skin is Normal or Affected",
-            "cancer_model": "Classifies type of skin cancer if Affected"
-        },
-        "status_classes": STATUS_CLASSES,
-        "cancer_classes": CANCER_CLASSES,
+        "model": "Skin Cancer Classification using TensorFlow Lite",
+        "classes": CLASS_NAMES,
+        "input_shape": "224x224 RGB image",
         "endpoints": {
-            "/predict": "POST - Provide image URL to classify",
+            "/predict": "POST - Upload an image file for classification",
             "/info": "GET - Get information about this API",
             "/ping": "GET - Health check endpoint"
         }
@@ -114,10 +118,8 @@ def info():
 def ping():
     return jsonify({
         "status": "ok",
-        "models_loaded": {
-            "status_model": True,
-            "cancer_model": True
-        }
+        "model_loaded": True,
+        "model_path": MODEL_PATH
     })
 
 if __name__ == "__main__":
